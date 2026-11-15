@@ -5,9 +5,8 @@ USB automotive scope). The main use case is automotive diagnostics.
 
 ## Status
 
-The app works fully in demo mode. **It has never run against the real scope.** That is the next
-step. Everything below "Unverified" is where to look first when hardware
-testing starts.
+The app runs against a real 1008B: about 16 fps burst capture at fast timebases, and roll mode
+works. The open question is the time axis at some timebases; see "Hardware status".
 
 ## Stack and layout
 
@@ -17,7 +16,7 @@ Windows). The target machine is Windows. Run it with `python -m scope1008 [--dem
 | File | Role |
 |---|---|
 | `scope1008/hantek1008.py` | Driver vendored from github.com/mfg92/hantek1008py (Apache-2.0). Its USB protocol came from reverse engineering a 1008C. Patches: `connect(backend, product_id)`; strict byte-compare asserts on calibration responses replaced with `_soft_check` (they matched only the original author's unit); the dummy `overrides` decorator fixed so import works without that package. |
-| `scope1008/backend.py` | `DeviceBackend` (real USB) and `DemoBackend` (synthetic automotive signals). Shared interface: `open/close/configure(AcqConfig)/acquire_burst()/roll_start/roll_read/roll_stop/recalibrate`. Both return input-referred volts in a `Frame`. Constants: timebase lists, `HW_SCALES`, `SAMPLES_PER_DIV`, roll rate selection. |
+| `scope1008/backend.py` | `DeviceBackend` (real USB) and `DemoBackend` (synthetic automotive signals). Shared interface: `open/close/configure(AcqConfig)/acquire_burst()/roll_start/roll_read/roll_stop/recalibrate`. Both return input-referred volts in a `Frame`. Constants: timebase lists, `HW_SCALES`, `RECORD_DIVS`, `BURST_SAMPLES_TOTAL`, roll rate selection. |
 | `scope1008/worker.py` | `AcqWorker(QThread)` owns the backend. It applies config changes between captures, emits `frame` and `status`, and gives up after 5 consecutive errors. |
 | `scope1008/dsp.py` | Pure numpy: `edge_crossings` (hysteresis plus sub-sample interpolation), `choose_trigger`, `measure` (noise-aware frequency, duty and rise time), `fft_dbv`, and the `si`/`si_short` formatters. |
 | `scope1008/app.py` | `MainWindow`, `ChannelCard` and the theme. Holds all display logic: probe/AC scaling, software trigger, roll ring buffer, cursors, measurements table, FFT, ref traces, CSV/PNG export, roll recording to CSV, and QSettings persistence. |
@@ -39,22 +38,32 @@ Windows). The target machine is Windows. Run it with `python -m scope1008 [--dem
 - **Volts:** `(raw - zero_offset[scale][ch]) * 0.01 * scale`. Zero offsets are measured at
   `init()` on all three ranges, so the inputs must be open at startup.
 
-## Unverified on real hardware (priority order)
+## Hardware status
 
-1. **Connection on Windows** after swapping the driver to WinUSB with Zadig (USB ID 0783:5725).
-   The 1008B might report a different product id; `SCOPE1008_PID` overrides it.
-2. **`init()` on this unit.** The original driver still has hard asserts elsewhere, for example
-   in `__send_a55a_command` and on response lengths. Run with `--debug` to log USB traffic.
-3. **Burst-mode timing.** `SAMPLES_PER_DIV = 25` comes from the driver's comments. The number of
-   samples per channel per burst, and whether it changes with the active channel count, are
-   unknown. Check against a known frequency.
-4. **Burst-mode behaviour with no trigger.** `__send_a55a_command` raises after 20 polls, and
-   `acquire_burst` treats that as "waiting" and returns None. Check whether the device
-   auto-triggers.
-5. **Changing active channels and scales mid-session** by replaying the tail of `_init3`, and
-   moving between roll and burst modes.
-6. **Roll mode** is the best-proven path in the original project. `rate_factor` scales the
-   sample rate up when fewer channels are active.
+Confirmed on a 1008B (WinUSB via Zadig, PID 5725): connect, `init()` (3.4 s), recalibration,
+burst capture and roll mode (measured rate within 1% of `rate_factor`).
+
+Findings that changed the code:
+- The driver's blanket 2 ms sleep before every USB command made a burst frame take 400 ms.
+  `fast_io` (on after init, off during calibration, `SCOPE1008_SAFE_IO=1` disables) drops it:
+  66 ms per frame, same data. Pipelining several a6 reads makes the device time out.
+- The device free-runs: frames arrive even when the trigger level is never crossed.
+- A burst record holds 4000 samples split across active channels and spans 10 divisions.
+  `dt = 10 * time/div / samples per channel`. Slow timebases need the full 10 div to fill, so
+  `acquire_burst` arms once and polls across calls in 100 ms slices (the driver gave up after
+  20 polls and restarted, so 100 ms/div and slower never produced a frame).
+
+Still unverified (priority order):
+1. **Timebase codes at 1, 2, 20 and 50 ms/div:** captures finish faster than 10 div. The driver's
+   `__burst_mode_ns_per_div_to_id_dic` is a 1-2-5 formula, not confirmed codes. Needs a known
+   frequency; `tools/check_device.py` and `tools/check_capture_time.py` help.
+2. **Fast timebases** (below about 200 us/div with 1 channel) would exceed the 2.4 MSa/s ADC if the
+   record really spans 10 div, so the record length there is probably different.
+3. **Changing active channels and scales mid-session** by replaying the tail of `_init3`.
+
+Hardware scripts in `tools/` (close the app first, only one program can hold the USB device):
+`bench_device.py`, `check_device.py`, `check_capture_time.py`, `check_burst_rates.py`,
+`gui_device_fps.py [us/div]`.
 
 ## Possible next work
 

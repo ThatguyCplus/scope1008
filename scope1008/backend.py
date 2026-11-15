@@ -21,7 +21,12 @@ N_CH = 8
 # Hardware pre-scale factors. 1 count = 10 mV * factor, ADC is 12 bit centred on ~2048.
 HW_SCALES = [1.0, 0.125, 0.02]
 COUNTS_HALF = 2047
-SAMPLES_PER_DIV = 25  # per the reverse-engineered driver: "a div contains around 25 samples"
+# Measured on a 1008B: a burst record always spans 10 divisions (the 'ready' flag rises
+# exactly 10 * time/div after arming at slow timebases) and holds 4000 samples split
+# across the active channels. dt therefore = 10 div * time/div / samples per channel.
+RECORD_DIVS = 10
+BURST_SAMPLES_TOTAL = 4000
+BURST_POLL_SLICE_S = 0.1  # max time acquire_burst blocks, so the worker stays responsive
 
 # Burst (triggered) timebases in ns/div. The ADC tops out at 2.4 MSa/s, so anything
 # faster than ~10 us/div is just interpolation; we start at 10 us.
@@ -146,6 +151,7 @@ class DeviceBackend:
         self._sent: dict = {}
         self._roll_gen = None
         self._roll_rate = ROLL_RATES[0]
+        self._armed_at: Optional[float] = None  # monotonic time the current capture was started
 
     # -- discovery --------------------------------------------------------------------
     def _diagnose_missing(self, backend, pid: int, err: Exception) -> str:
@@ -192,6 +198,7 @@ class DeviceBackend:
         except Exception as e:
             self._release(dev)
             raise BackendError(f"Scope found but init failed: {e!r}. Unplug/replug and retry.") from e
+        dev.fast_io = os.environ.get("SCOPE1008_SAFE_IO", "") != "1"
         self.dev = dev
         self._sent = {}
 
@@ -232,6 +239,7 @@ class DeviceBackend:
         """Push only the settings that changed (vertical scale costs ~0.2 s)."""
         cfg.validate()
         self.roll_stop()
+        self._armed_at = None
         self.cfg = cfg.copy()
         active = sorted(cfg.active) or [0]
         trig_scale = cfg.hw_scales[cfg.trig_ch]
@@ -262,7 +270,11 @@ class DeviceBackend:
 
     def recalibrate(self) -> None:
         self.roll_stop()
-        self.dev._init2()
+        fast, self.dev.fast_io = self.dev.fast_io, False  # calibration keeps original timing
+        try:
+            self.dev._init2()
+        finally:
+            self.dev.fast_io = fast
         self._sent = {}
         if self.cfg:
             self.configure(self.cfg)
@@ -279,21 +291,65 @@ class DeviceBackend:
             clipped[ch] = bool(a.size and (a.min() <= 2 or a.max() >= 4093))
         return data, clipped
 
+    def _send(self, cmd_id: int, parameter=b"", response_length: int = 0, echo_expected: bool = True,
+              sec_till_response_request: float = 0.0) -> bytes:
+        return self.dev._Hantek1008Raw__send_cmd(
+            cmd_id, parameter=parameter, response_length=response_length, echo_expected=echo_expected,
+            sec_till_response_request=sec_till_response_request)
+
+    def capture_timeout(self) -> float:
+        """How long a capture may take before it is considered lost and re-armed."""
+        return RECORD_DIVS * self.cfg.ns_per_div * 1e-9 * 1.5 + 1.0
+
     def acquire_burst(self) -> Optional[Frame]:
+        """One triggered record, or None if it is still filling.
+
+        Same command sequence as the driver's request_samples_burst_mode, split into
+        arm / poll / read so a slow capture (2 s at 200 ms/div) is polled across calls
+        instead of being abandoned and restarted after a fixed 20 polls.
+        """
         from .hantek1008 import Hantek1008Raw
-        try:
-            raw = Hantek1008Raw.request_samples_burst_mode(self.dev)
-        except RuntimeError as e:
-            if "a55a" in str(e):
-                return None  # no capture ready (waiting for trigger)
-            raise
+        now = time.monotonic()
+        if self._armed_at is not None and now - self._armed_at > self.capture_timeout():
+            log.warning("burst capture not ready after %.1f s, re-arming", now - self._armed_at)
+            self._armed_at = None
+        if self._armed_at is None:
+            self._cmd("send_ping")
+            self._send(0xe4, [0x01])
+            self._send(0xe6, [0x01], response_length=10, echo_expected=False)
+            self._send(0xa4, [0x01], sec_till_response_request=0.015)
+            self._send(0xc0)
+            self._send(0xc2)
+            self._armed_at = time.monotonic()
+        deadline = time.monotonic() + BURST_POLL_SLICE_S
+        while True:
+            state = self._send(0xa5, [0x5a], response_length=1)[0]
+            if state in (2, 3):
+                break
+            if state not in (0, 1):
+                self._armed_at = None
+                raise IOError(f"unexpected capture state 0x{state:02x}")
+            if time.monotonic() >= deadline:
+                return None  # still filling; poll again on the next call
+            time.sleep(0.005)
+            self._cmd("send_ping")
+        self._armed_at = None
+        samples = self._cmd("send_c6_a6_command", 0x02) + self._cmd("send_c6_a6_command", 0x03)
+        self._send(0xe4, [0x01])
+        self._send(0xe6, [0x01], response_length=10, echo_expected=False)
+        shorts = Hantek1008Raw._Hantek1008Raw__from_bytes_to_shorts(samples)
+        raw = Hantek1008Raw._Hantek1008Raw__to_per_channel_lists(shorts, sorted(self.cfg.active))
         data, clipped = self._to_volts(raw)
-        dt = self.cfg.ns_per_div * 1e-9 / SAMPLES_PER_DIV
+        n = min((v.size for v in data.values()), default=0)
+        if n == 0:
+            return None
+        dt = RECORD_DIVS * self.cfg.ns_per_div * 1e-9 / n
         return Frame("burst", dt, data, clipped)
 
     def roll_start(self, rate: float) -> None:
         from .hantek1008 import Hantek1008Raw
         self.roll_stop()
+        self._armed_at = None
         self._roll_rate = rate
         self._roll_gen = Hantek1008Raw.request_samples_roll_mode(self.dev, sampling_rate=rate)
 
@@ -396,9 +452,8 @@ class DemoBackend:
 
     def acquire_burst(self) -> Optional[Frame]:
         n_act = max(1, len(self.cfg.active))
-        n = int(4096 / n_act) if n_act > 1 else 4096
-        n = min(n, 2048)
-        dt = self.cfg.ns_per_div * 1e-9 / SAMPLES_PER_DIV
+        n = BURST_SAMPLES_TOTAL // n_act  # same record shape as the real scope
+        dt = RECORD_DIVS * self.cfg.ns_per_div * 1e-9 / n
         window = n * dt
         # pace like a USB scope: ~30 fps, slower for long captures
         time.sleep(max(0.03, min(window, 2.0)))

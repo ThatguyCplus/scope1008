@@ -112,6 +112,11 @@ class Hantek1008Raw:
         self.__pause_thread: Optional[Thread] = None
         self.__cancel_pause_thread: bool = False
 
+        # Scope1008 patch: when True, skip the blanket ~2 ms waits before each command.
+        # Measured on a 1008B: burst frame 400 ms -> 66 ms with identical data. Waits longer
+        # than 5 ms (scale changes, calibration) are deliberate and always kept.
+        self.fast_io: bool = False
+
     def connect(self, backend=None, product_id: int = 0x5725) -> None:
         """Find a plugged in hantek 1008 device and set up the connection to it"""
 
@@ -152,11 +157,19 @@ class Hantek1008Raw:
         assert isinstance(message, bytes)
         log.debug(f">[{len(message):2}] {bytes.hex(message)}")
 
-        sleep(sec_till_start)
+        if self.fast_io:
+            if sec_till_start <= 0.005:
+                sec_till_start = 0
+            if sec_till_response_request <= 0.005:
+                sec_till_response_request = 0
+
+        if sec_till_start:
+            sleep(sec_till_start)
 
         self.__out.write(message)
 
-        sleep(sec_till_response_request)
+        if sec_till_response_request:
+            sleep(sec_till_response_request)
 
         response = bytes(self.__in.read(response_length))
 

@@ -85,10 +85,13 @@ channel on every range. If a probe is on a live signal you get a DC offset error
 
 ## Known limits
 
-* The protocol reverse engineering is partial and was done on a single 1008C. Roll mode is the
-  best-tested path in the original driver. Burst (triggered) mode should work but is less proven.
-* Burst timebase assumes about 25 samples/div (from the driver notes). Sanity check the time axis
-  once against a known frequency; if it is off, change `SAMPLES_PER_DIV` in `scope1008/backend.py`.
+* The protocol reverse engineering is partial. Connection, zero calibration, burst capture
+  (about 16 fps at fast timebases) and roll mode are confirmed on a 1008B.
+* **Time axis:** a burst record spans 10 divisions (measured exactly at 5, 10, 100 and 200 ms/div)
+  and holds 4000 samples split across the active channels. At 1, 2, 20 and 50 ms/div the scope
+  finishes captures faster than 10 divisions should take, so the timebase code for those settings
+  may be wrong. Check with a signal of known frequency: `.venv\Scripts\python tools\check_device.py`.
+* Slow timebases update once per capture: 200 ms/div shows a new frame every 2 s.
 * If your unit reports a different USB product id, set `SCOPE1008_PID=xxxx` before launching
   (the error message tells you the id it found).
 * The 8 digital outputs (waveform generator) are not exposed yet.
