@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.2.0"
 description = "Usable replacement software for the Hantek 1008A/B/C 8-channel USB scope"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "scope1008/LICENSE-hantek1008py"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: Microsoft :: Windows",

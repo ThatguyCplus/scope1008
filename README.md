@@ -92,3 +92,8 @@ channel on every range. If a probe is on a live signal you get a DC offset error
 * If your unit reports a different USB product id, set `SCOPE1008_PID=xxxx` before launching
   (the error message tells you the id it found).
 * The 8 digital outputs (waveform generator) are not exposed yet.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The vendored driver `scope1008/hantek1008.py` stays under
+Apache-2.0 ([scope1008/LICENSE-hantek1008py](scope1008/LICENSE-hantek1008py)).
