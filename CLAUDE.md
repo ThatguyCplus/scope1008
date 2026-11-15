@@ -11,7 +11,7 @@ testing starts.
 
 ## Stack and layout
 
-Python 3.10+, PySide6, pyqtgraph, numpy, pyusb and libusb-package (which bundles the libusb DLL on
+Python 3.12+, PySide6-Essentials, pyqtgraph, numpy, pyusb and libusb-package (which bundles the libusb DLL on
 Windows). The target machine is Windows. Run it with `python -m scope1008 [--demo] [--debug] [--reset]`.
 
 | File | Role |
@@ -64,10 +64,24 @@ Windows). The target machine is Windows. Run it with `python -m scope1008 [--dem
 - Automotive presets (ignition, injector, crank/cam correlation) and protocol decode (UART/CAN).
 - Persistence display mode and per-channel math (A−B and so on).
 
+## Dependencies and safety rules
+
+- Dependencies are declared as ranges in `pyproject.toml` and pinned with hashes in
+  `requirements.lock` / `requirements-dev.lock` (regenerate with pip-compile, see SECURITY.md).
+  `tools/bootstrap.py` installs them into `.venv`; the launchers call it.
+- Every `AcqConfig` goes through `validate()` before reaching USB. Add a check there for any new
+  device setting.
+- Saved settings are untrusted input: parse them through `channel_from_dict`, `_num`, `_idx`.
+- Text from devices, the OS or the user shown in a rich-text label goes through `html.escape`
+  (`_set_status`). CSV header cells go through `csv_cell`.
+- The roll generator in the driver yields `{}` as a heartbeat when no data arrives for 0.25 s,
+  so the worker can always stop.
+
 ## Verify after changes
 
 ```
-python -m pytest -q tests/test_dsp.py
+python -m pytest -q
+python -m ruff check .
 QT_QPA_PLATFORM=offscreen python tests/gui_smoke.py burst
 QT_QPA_PLATFORM=offscreen python tests/gui_smoke.py roll
 ```

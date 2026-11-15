@@ -12,13 +12,20 @@ It talks to the scope directly over USB using the protocol reverse‑engineered 
 
 ## Install
 
-Python 3.10 or newer.
+Install Python 3.12 or newer from python.org, then just run the launcher:
 
-```
-pip install -r requirements.txt
-```
+* Windows: double-click `run.bat` (or `run_demo.bat` to try it without the scope)
+* Linux: `./run.sh` (or `./run.sh --demo`)
 
-Try it without the scope first: `run_demo.bat` (or `python -m scope1008 --demo`). The demo feeds
+The first launch creates a private `.venv` folder and installs the exact package versions in
+`requirements.lock`. Every download is checked against a SHA-256 hash, so a tampered package
+won't install. Later launches skip this step unless the lock file changes. Nothing is installed
+into your system Python.
+
+Manual setup, if you prefer: `python tools/bootstrap.py`, then `.venv\Scripts\python -m scope1008`.
+For development, `python tools/bootstrap.py --dev` adds pytest, ruff and pip-audit.
+
+Try it without the scope first: `run_demo.bat` (or `run.sh --demo`). The demo feeds
 automotive-ish test signals (PWM, 60‑2 crank VR, cam hall, charging ripple, O2, TPS, UART).
 
 ### Windows: give the scope a WinUSB driver (one time)

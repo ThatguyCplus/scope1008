@@ -140,8 +140,9 @@ class Hantek1008Raw:
             # match the first IN endpoint
             custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN)
 
-        assert self.__out is not None
-        assert self.__in is not None
+        # Scope1008 patch: explicit raise, not assert, so this survives `python -O`.
+        if self.__out is None or self.__in is None:
+            raise RuntimeError("Hantek 1008 USB interface has no bulk IN/OUT endpoints")
 
     def __write_and_receive(self, message: bytes, response_length: int,
                             sec_till_response_request: float = 0.002, sec_till_start: float = 0.002) -> bytes:
@@ -161,7 +162,8 @@ class Hantek1008Raw:
 
         log.debug(f"<[{len(response):2}] {bytes.hex(response)}")
         log.debug(f"delta: {time.time()-start_time:02.4f} sec")
-        assert len(response) == response_length
+        if len(response) != response_length:  # Scope1008 patch: was assert
+            raise IOError(f"short USB response: expected {response_length} bytes, got {len(response)}")
 
         return response
 
@@ -181,7 +183,8 @@ class Hantek1008Raw:
                                             sec_till_response_request=sec_till_response_request,
                                             sec_till_start=sec_till_start)
         if echo_expected:
-            assert response[0] == cmd_id
+            if response[0] != cmd_id:  # Scope1008 patch: was assert
+                raise IOError(f"device did not echo command 0x{cmd_id:02x} (got 0x{response[0]:02x})")
             return response[1:]
         else:
             return response
@@ -501,6 +504,7 @@ class Hantek1008Raw:
 
             while True:
                 ready_data_length = 0
+                idle_since = time.monotonic()
                 while ready_data_length == 0:
                     self.__send_ping()
 
@@ -508,7 +512,14 @@ class Hantek1008Raw:
                     ready_data_length = int.from_bytes(response, byteorder="big", signed=False)
                     # ready_data_length =
                     #  (active_channels + ONE_MYSTIC_EXTRA_CHANNEL) * TWO_BYTES_PER_SAMPLE * row_count
-                    assert ready_data_length % ((len(self.__active_channels) + 1)*2) == 0
+                    if ready_data_length % ((len(self.__active_channels) + 1)*2) != 0:
+                        raise IOError(f"roll mode: ready length {ready_data_length} does not match "
+                                      f"{len(self.__active_channels)} active channels")
+                    if ready_data_length == 0 and time.monotonic() - idle_since > 0.25:
+                        # Scope1008 patch: yield an empty heartbeat instead of polling forever,
+                        # so the caller can stop or reconfigure at slow sample rates.
+                        yield {}
+                        idle_since = time.monotonic()
 
                 sample_response = b''
                 while ready_data_length > 0:
@@ -756,7 +767,7 @@ class Hantek1008(Hantek1008Raw):
             self.__zero_offset_shift_compensation_value = \
                 (1.0 - adaption_factor) * self.__zero_offset_shift_compensation_value \
                 + adaption_factor * delta
-        log.debug("zosc-value", self.__zero_offset_shift_compensation_value)
+        log.debug("zosc-value %s", self.__zero_offset_shift_compensation_value)
 
     @overrides
     def get_zero_offset(self, channel_id: int, vscale: Optional[float] = None) -> float:

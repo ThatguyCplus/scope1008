@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass, asdict
@@ -12,18 +14,18 @@ from typing import Dict, List, Optional
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, QSettings, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QAction
+from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
+    QApplication, QButtonGroup, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem, QToolButton,
+    QScrollArea, QSplitter, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
 )
 
 from . import dsp
 from .backend import (
     AcqConfig, BURST_NS_PER_DIV, HW_SCALES, N_CH, ROLL_S_PER_DIV, DemoBackend, Frame,
-    hw_full_scale, pick_roll_rate, rate_factor,
+    hw_full_scale, pick_roll_rate,
 )
 from .worker import AcqWorker
 
@@ -36,6 +38,9 @@ BORDER = "#1f2a37"
 TEXT = "#d1d5db"
 MUTED = "#7b8794"
 X_DIVS, Y_DIVS = 10, 8
+MAX_NAME = 24
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,6 +55,49 @@ class Channel:
 
 
 RANGE_LABELS = {1.0: "±20 V", 0.125: "±2.5 V", 0.02: "±0.4 V"}
+COUPLINGS = ("DC", "AC")
+MODES = ("auto", "normal", "roll")
+
+
+def clean_name(text: object) -> str:
+    """Channel label: printable characters only, bounded length."""
+    t = "".join(ch for ch in str(text) if ch.isprintable())
+    return t.strip()[:MAX_NAME]
+
+
+def csv_cell(text: str) -> str:
+    """Neutralise spreadsheet formula injection (=, +, -, @ at the start of a cell)."""
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def _num(v, default: float, lo: float, hi: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, f)) if math.isfinite(f) else default
+
+
+def _idx(v, default: int, n: int) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < n else default
+
+
+def channel_from_dict(d: object, i: int) -> Channel:
+    """Build a Channel from saved settings, falling back to defaults for anything odd."""
+    base = Channel(enabled=i < 2)
+    if not isinstance(d, dict):
+        return base
+    vdiv = _num(d.get("vdiv"), base.vdiv, VDIVS[0], VDIVS[-1])
+    probe = d.get("probe")
+    return Channel(
+        enabled=bool(d.get("enabled", base.enabled)),
+        name=clean_name(d.get("name", "")),
+        vdiv=vdiv,
+        offset=_num(d.get("offset"), 0.0, -Y_DIVS / 2, Y_DIVS / 2),
+        probe=probe if probe in PROBES else 1,
+        coupling=d.get("coupling") if d.get("coupling") in COUPLINGS else "DC",
+        range=d.get("range") if d.get("range") in ("Auto", *RANGE_LABELS.values()) else "Auto",
+    )
 
 
 def fmt_tdiv(seconds: float) -> str:
@@ -92,6 +140,7 @@ class ChannelCard(QFrame):
             f" border-radius:4px; font-weight:600; padding:3px; }}"
             f"QPushButton:checked {{ background:{color}; color:#0b0f14; border-color:{color}; }}")
         self.name = QLineEdit(ch.name)
+        self.name.setMaxLength(MAX_NAME)
         self.name.setPlaceholderText("label")
         self.scale_lbl = QLabel()
         self.scale_lbl.setStyleSheet(f"color:{color}; font-family:monospace; font-weight:600;")
@@ -170,7 +219,7 @@ class ChannelCard(QFrame):
     def _ui(self, *_):
         c = self.ch
         c.enabled = self.btn.isChecked()
-        c.name = self.name.text().strip()
+        c.name = clean_name(self.name.text())
         c.vdiv = self.vdiv.currentData() or c.vdiv
         c.offset = self.offset.value()
         c.probe = self.probe.currentData()
@@ -230,6 +279,7 @@ class MainWindow(QMainWindow):
         self.rec_writer = None
         self.rec_t = 0.0
         self.rec_count = 0
+        self._rec_flush = 0.0
         self.frame_times: List[float] = []
         self.trig_state = ""
         self._last_meas = 0.0
@@ -245,21 +295,27 @@ class MainWindow(QMainWindow):
         raw = self.settings.value("state")
         if not raw:
             return
+        # Every field is checked: a hand-edited or corrupted settings store must never
+        # crash startup or push out-of-range values to the scope.
         try:
-            s = json.loads(raw)
-            self.channels = [Channel(**c) for c in s["channels"]][:N_CH]
-            self.mode = s.get("mode", "auto")
-            self.tdiv_i = min(s.get("tdiv_i", self.tdiv_i), len(BURST_NS_PER_DIV) - 1)
-            self.roll_i = min(s.get("roll_i", self.roll_i), len(ROLL_S_PER_DIV) - 1)
-            self.trig_ch = s.get("trig_ch", 0)
-            self.trig_rising = s.get("trig_rising", True)
-            self.trig_level = s.get("trig_level", 1.0)
-            self.hpos = s.get("hpos", 0.0)
-            self.measure_ch = s.get("measure_ch", 0)
-            if self.mode == "single":
-                self.mode = "normal"
-        except Exception:
-            pass
+            s = json.loads(raw) if isinstance(raw, str) and len(raw) < 100_000 else None
+        except ValueError:
+            s = None
+        if not isinstance(s, dict):
+            log.warning("ignoring unreadable saved settings")
+            return
+        chans = s.get("channels")
+        if isinstance(chans, list):
+            self.channels = [channel_from_dict(chans[i] if i < len(chans) else None, i) for i in range(N_CH)]
+        mode = s.get("mode", "auto")
+        self.mode = "normal" if mode == "single" else (mode if mode in MODES else "auto")
+        self.tdiv_i = _idx(s.get("tdiv_i"), self.tdiv_i, len(BURST_NS_PER_DIV))
+        self.roll_i = _idx(s.get("roll_i"), self.roll_i, len(ROLL_S_PER_DIV))
+        self.trig_ch = _idx(s.get("trig_ch"), 0, N_CH)
+        self.trig_rising = bool(s.get("trig_rising", True))
+        self.trig_level = _num(s.get("trig_level"), 1.0, -1000.0, 1000.0)
+        self.hpos = _num(s.get("hpos"), 0.0, -X_DIVS * 10, X_DIVS * 10)
+        self.measure_ch = _idx(s.get("measure_ch"), 0, N_CH)
 
     def save_state(self):
         s = dict(channels=[asdict(c) for c in self.channels], mode=self.mode, tdiv_i=self.tdiv_i,
@@ -638,10 +694,14 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_status(self, state: str, msg: str):
-        colors = {"ok": "#4ade80", "demo": "#fbbf24", "connecting": "#60a5fa", "error": "#f87171"}
-        self.status_lbl.setText(f"<span style='color:{colors.get(state, TEXT)}'>●</span> {msg}")
+        colors = {"ok": "#4ade80", "demo": "#fbbf24", "connecting": "#60a5fa", "warn": "#fbbf24",
+                  "error": "#f87171"}
+        safe = html.escape(msg)  # device/OS error text is shown as rich text
+        self.status_lbl.setText(f"<span style='color:{colors.get(state, TEXT)}'>●</span> {safe}")
+        if state == "warn":
+            return
         if state == "error":
-            self.banner_lbl.setText(f"<b>Scope not available.</b> {msg}")
+            self.banner_lbl.setText(f"<b>Scope not available.</b> {safe}")
             self.banner.show()
             if not self.demo:
                 # keep the UI alive with demo signals so it's still useful
@@ -848,7 +908,7 @@ class MainWindow(QMainWindow):
         self.vb.setRange(xRange=(l, r), yRange=(-Y_DIVS / 2, Y_DIVS / 2), padding=0)
         for i, ln in enumerate(self.grid_lines):
             ln.setValue(l + i * td)
-        for i, (c, m) in enumerate(zip(self.channels, self.gnd_marks)):
+        for c, m in zip(self.channels, self.gnd_marks):
             m.setVisible(c.enabled)
             m.setPos(l, max(-Y_DIVS / 2 + 0.15, min(Y_DIVS / 2 - 0.15, c.offset)))
         tc = self.channels[self.trig_ch]
@@ -955,7 +1015,16 @@ class MainWindow(QMainWindow):
             cols = [fr.data[c][:n] * self.channels[c].probe for c in chans]
             t = self.rec_t + np.arange(n) * fr.dt
             self.rec_t += n * fr.dt
-            self.rec_writer.writerows(zip(*([np.round(t, 6)] + [np.round(c, 5) for c in cols])))
+            try:
+                self.rec_writer.writerows(zip(*([np.round(t, 6)] + [np.round(c, 5) for c in cols])))
+                if time.time() - self._rec_flush > 1.0:
+                    self.rec_file.flush()
+                    self._rec_flush = time.time()
+            except OSError as e:
+                log.error("recording write failed: %s", e)
+                self.rec_btn.setChecked(False)  # closes the file via toggle_record
+                self._set_status(f"Recording stopped: {e}")
+                return
             self.rec_count += n
         now = time.time()
         if now - self._last_roll_draw > 1 / 30:
@@ -1085,6 +1154,9 @@ class MainWindow(QMainWindow):
         self.refs = {}
         self.redraw()
 
+    def _set_status(self, text: str) -> None:
+        self.status_lbl.setText(html.escape(text))
+
     def _ask_path(self, title, suffix, filt):
         default = Path.home() / f"scope1008_{time.strftime('%Y%m%d_%H%M%S')}.{suffix}"
         p, _ = QFileDialog.getSaveFileName(self, title, str(default), filt)
@@ -1106,26 +1178,32 @@ class MainWindow(QMainWindow):
         if not p:
             return
         chans = sorted(views)
-        with open(p, "w", newline="") as f:
-            f.write(f"# Scope1008 export {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# mode={self.mode} timebase={self.tdiv_lbl.text()} trigger=CH{self.trig_ch + 1} "
-                    f"{'rising' if self.trig_rising else 'falling'} {self.trig_level:.4g} V\n")
-            for i in chans:
-                c = self.channels[i]
-                f.write(f"# CH{i + 1} '{c.name}' probe={c.probe}x coupling={c.coupling} "
-                        f"range={RANGE_LABELS[self.hw_scale(i)]}\n")
-            w = csv.writer(f)
-            w.writerow(["time_s"] + [f"CH{i + 1}{'_' + self.channels[i].name if self.channels[i].name else ''}_V"
-                                     for i in chans])
-            for row in zip(np.round(x, 9), *[np.round(views[i], 5) for i in chans]):
-                w.writerow(row)
-        self.status_lbl.setText(f"Saved {p}")
+        try:
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                f.write(f"# Scope1008 export {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# mode={self.mode} timebase={self.tdiv_lbl.text()} trigger=CH{self.trig_ch + 1} "
+                        f"{'rising' if self.trig_rising else 'falling'} {self.trig_level:.4g} V\n")
+                for i in chans:
+                    c = self.channels[i]
+                    f.write(f"# CH{i + 1} '{clean_name(c.name)}' probe={c.probe}x coupling={c.coupling} "
+                            f"range={RANGE_LABELS[self.hw_scale(i)]}\n")
+                w = csv.writer(f)
+                w.writerow(["time_s"] + [csv_cell(f"CH{i + 1}{'_' + clean_name(self.channels[i].name) if self.channels[i].name else ''}_V")
+                                         for i in chans])
+                w.writerows(zip(np.round(x, 9), *[np.round(views[i], 5) for i in chans]))
+        except OSError as e:
+            log.error("CSV export failed: %s", e)
+            self._set_status(f"Could not save CSV: {e}")
+            return
+        self._set_status(f"Saved {p}")
 
     def export_png(self):
         p = self._ask_path("Save screenshot", "png", "PNG (*.png)")
         if p:
-            self.centralWidget().grab().save(p)
-            self.status_lbl.setText(f"Saved {p}")
+            if self.centralWidget().grab().save(p):
+                self._set_status(f"Saved {p}")
+            else:
+                self._set_status(f"Could not save PNG to {p}")
 
     def toggle_record(self, on: bool):
         if on:
@@ -1135,29 +1213,40 @@ class MainWindow(QMainWindow):
                 self.rec_btn.setChecked(False)
                 self.rec_btn.blockSignals(False)
                 return
-            self.rec_file = open(p, "w", newline="")
-            self.rec_file.write(f"# Scope1008 roll recording started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            self.rec_file.write(f"# sample rate {1 / self.roll_dt:.3f} Sa/s per channel\n")
-            self.rec_writer = csv.writer(self.rec_file)
-            act = self.active()
-            self.rec_writer.writerow(["time_s"] + [f"CH{i + 1}_V" for i in act])
+            try:
+                f = open(p, "w", newline="", encoding="utf-8")  # closed in toggle_record(False)
+                f.write(f"# Scope1008 roll recording started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"# sample rate {1 / self.roll_dt:.3f} Sa/s per channel\n")
+                w = csv.writer(f)
+                w.writerow(["time_s"] + [f"CH{i + 1}_V" for i in self.active()])
+            except OSError as e:
+                log.error("cannot start recording: %s", e)
+                self.rec_btn.blockSignals(True)
+                self.rec_btn.setChecked(False)
+                self.rec_btn.blockSignals(False)
+                self._set_status(f"Could not record to {p}: {e}")
+                return
+            self.rec_file, self.rec_writer = f, w
             self.rec_t = 0.0
             self.rec_count = 0
-            self.status_lbl.setText(f"Recording to {p}")
+            self._rec_flush = time.time()
+            self._set_status(f"Recording to {p}")
         else:
-            if self.rec_file:
-                self.rec_file.close()
-                self.status_lbl.setText(f"Recording stopped, {self.rec_count} rows")
-            self.rec_file = None
-            self.rec_writer = None
+            f, self.rec_file, self.rec_writer = self.rec_file, None, None
+            if f:
+                try:
+                    f.close()
+                    self._set_status(f"Recording stopped, {self.rec_count} rows")
+                except OSError as e:
+                    self._set_status(f"Recording stopped with a write error: {e}")
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):
         self.save_state()
-        if self.rec_file:
-            self.rec_file.close()
-        if self.worker:
+        if self.worker:  # stop acquisition first so no frame arrives after the file closes
             self.worker.stop()
+        if self.rec_file:
+            self.rec_btn.setChecked(False)
         super().closeEvent(ev)
 
 

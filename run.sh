@@ -1,2 +1,5 @@
 #!/bin/sh
-cd "$(dirname "$0")" && exec python3 -m scope1008 "$@"
+set -eu
+cd "$(dirname "$0")"
+python3 tools/bootstrap.py
+exec .venv/bin/python -m scope1008 "$@"

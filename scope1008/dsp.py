@@ -108,7 +108,7 @@ def si(value: float, unit: str, digits: int = 3) -> str:
         return f"0 {unit}"
     prefixes = [(1e9, "G"), (1e6, "M"), (1e3, "k"), (1, ""), (1e-3, "m"), (1e-6, "µ"), (1e-9, "n")]
     a = abs(value)
-    for scale, p in prefixes:
+    for scale, p in prefixes:  # noqa: B007 - p is used after the loop
         if a >= scale * 0.9995:
             break
     s = value / scale

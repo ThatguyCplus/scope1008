@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -68,6 +69,28 @@ class AcqConfig:
         return AcqConfig(list(self.active), list(self.hw_scales), self.ns_per_div, self.trig_ch,
                          self.trig_slope, self.trig_level_in, self.roll, self.roll_rate)
 
+    def validate(self) -> None:
+        """Reject anything the device does not support before it reaches the USB link.
+
+        The vendored driver checks its inputs with `assert`, which `python -O` strips, so
+        this is the real gate between the GUI and the hardware.
+        """
+        act = list(self.active)
+        if not all(isinstance(c, int) and 0 <= c < N_CH for c in act) or len(set(act)) != len(act):
+            raise ConfigError(f"invalid active channels {act!r}")
+        if len(self.hw_scales) != N_CH or any(s not in HW_SCALES for s in self.hw_scales):
+            raise ConfigError(f"invalid hardware scales {self.hw_scales!r}")
+        if self.ns_per_div not in BURST_NS_PER_DIV:
+            raise ConfigError(f"unsupported timebase {self.ns_per_div!r} ns/div")
+        if not (isinstance(self.trig_ch, int) and 0 <= self.trig_ch < N_CH):
+            raise ConfigError(f"invalid trigger channel {self.trig_ch!r}")
+        if self.trig_slope not in ("rising", "falling"):
+            raise ConfigError(f"invalid trigger slope {self.trig_slope!r}")
+        if not math.isfinite(self.trig_level_in):
+            raise ConfigError("trigger level must be a finite number")
+        if self.roll_rate not in ROLL_RATES:
+            raise ConfigError(f"unsupported roll rate {self.roll_rate!r}")
+
 
 @dataclass
 class Frame:
@@ -82,6 +105,24 @@ class BackendError(RuntimeError):
     pass
 
 
+class ConfigError(ValueError):
+    """A configuration the device cannot accept. Not a hardware fault."""
+
+
+def product_id_from_env(default: int = 0x5725) -> int:
+    """SCOPE1008_PID as a 16-bit hex USB product id, or the default."""
+    raw = os.environ.get("SCOPE1008_PID", "").strip()
+    if not raw:
+        return default
+    try:
+        pid = int(raw, 16)
+    except ValueError:
+        raise BackendError(f"SCOPE1008_PID={raw!r} is not a hex USB product id (e.g. 5725)") from None
+    if not 0 <= pid <= 0xFFFF:
+        raise BackendError(f"SCOPE1008_PID={raw!r} is out of range (0000-ffff)")
+    return pid
+
+
 # --------------------------------------------------------------------------------------
 # Real device
 # --------------------------------------------------------------------------------------
@@ -90,7 +131,8 @@ def _usb_backend():
     try:
         import libusb_package  # ships libusb-1.0 DLL for Windows/macOS
         return libusb_package.get_libusb1_backend()
-    except Exception:
+    except Exception as e:
+        log.warning("libusb-package unavailable, falling back to the system libusb: %s", e)
         return None
 
 
@@ -103,18 +145,28 @@ class DeviceBackend:
         self.cfg: Optional[AcqConfig] = None
         self._sent: dict = {}
         self._roll_gen = None
+        self._roll_rate = ROLL_RATES[0]
 
     # -- discovery --------------------------------------------------------------------
-    def _diagnose_missing(self, backend) -> str:
+    def _diagnose_missing(self, backend, pid: int, err: Exception) -> str:
         try:
             import usb.core
             found = list(usb.core.find(find_all=True, idVendor=self.VID, backend=backend) or [])
         except Exception as e:  # no libusb at all
             return (f"libusb not available ({e}). Run: pip install libusb-package")
+        if any(d.idProduct == pid for d in found):
+            # Enumerated but not openable. On Windows pyusb raises NotImplementedError
+            # (a RuntimeError) when the device is bound to a non-WinUSB driver.
+            if sys.platform.startswith("win"):
+                return ("The Hantek 1008 is plugged in but still uses Hantek's driver, which libusb "
+                        "cannot open. Switch it to WinUSB with Zadig (see README), then Retry. "
+                        f"[{type(err).__name__}: {err}]")
+            return (f"The Hantek 1008 is plugged in but could not be opened ({err}). On Linux this is "
+                    "usually permissions: install the udev rule from the README and replug.")
         if found:
             pids = ", ".join(f"{d.idProduct:04x}" for d in found)
-            return (f"Found a Hantek device with product id {pids}, expected {self.PID:04x}. "
-                    "Scope1008 will try it anyway next time if you set SCOPE1008_PID.")
+            return (f"Found a Hantek device with product id {pids}, expected {pid:04x}. "
+                    "If it is a 1008 variant, set SCOPE1008_PID to that id and relaunch.")
         if sys.platform.startswith("win"):
             return ("No Hantek 1008 visible to libusb. On Windows the scope must use the WinUSB "
                     "driver: run Zadig, pick the Hantek device, install WinUSB (see README).")
@@ -122,32 +174,47 @@ class DeviceBackend:
                 "from the README (or run once with sudo).")
 
     def open(self) -> None:
-        import os
         from .hantek1008 import Hantek1008
         backend = _usb_backend()
-        pid = int(os.environ.get("SCOPE1008_PID", "5725"), 16)
+        pid = product_id_from_env(self.PID)
         dev = Hantek1008(ns_per_div=500_000, vertical_scale_factor=1.0,
                          active_channels=list(range(N_CH)))
         try:
             dev.connect(backend=backend, product_id=pid)
-        except RuntimeError:
-            raise BackendError(self._diagnose_missing(backend))
+        except RuntimeError as e:
+            self._release(dev)
+            raise BackendError(self._diagnose_missing(backend, pid, e)) from e
         except Exception as e:
-            raise BackendError(f"USB error while opening the scope: {e}")
+            self._release(dev)
+            raise BackendError(f"USB error while opening the scope: {e}") from e
         try:
             dev.init()  # includes zero-offset calibration for all 3 ranges
         except Exception as e:
-            raise BackendError(f"Scope found but init failed: {e!r}. Unplug/replug and retry.")
+            self._release(dev)
+            raise BackendError(f"Scope found but init failed: {e!r}. Unplug/replug and retry.") from e
         self.dev = dev
         self._sent = {}
+
+    @staticmethod
+    def _release(dev) -> None:
+        """Free the USB interface so a retry (or another program) can claim it."""
+        handle = getattr(dev, "_dev", None)
+        if handle is None:
+            return
+        try:
+            import usb.util
+            usb.util.dispose_resources(handle)
+        except Exception as e:
+            log.debug("dispose_resources failed: %s", e)
 
     def close(self) -> None:
         self.roll_stop()
         if self.dev is not None:
             try:
                 self.dev.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("error while closing the scope: %s", e)
+            self._release(self.dev)
         self.dev = None
 
     # -- private driver access (name-mangled in the vendored driver) --------------------
@@ -163,12 +230,13 @@ class DeviceBackend:
 
     def configure(self, cfg: AcqConfig) -> None:
         """Push only the settings that changed (vertical scale costs ~0.2 s)."""
+        cfg.validate()
         self.roll_stop()
         self.cfg = cfg.copy()
         active = sorted(cfg.active) or [0]
         trig_scale = cfg.hw_scales[cfg.trig_ch]
-        level_raw = int(round(self.zero(cfg.trig_ch, trig_scale) + cfg.trig_level_in / (0.01 * trig_scale)))
-        level_raw = max(0, min(4095, level_raw))
+        level = self.zero(cfg.trig_ch, trig_scale) + cfg.trig_level_in / (0.01 * trig_scale)
+        level_raw = max(0, min(4095, int(round(level))))
         want = {
             "active": tuple(active),
             "scales": tuple(cfg.hw_scales),
@@ -202,6 +270,9 @@ class DeviceBackend:
     def _to_volts(self, raw: Dict[int, list]):
         data, clipped = {}, {}
         for ch, vals in raw.items():
+            if not (isinstance(ch, int) and 0 <= ch < N_CH):
+                log.warning("ignoring data for unknown channel %r", ch)
+                continue
             a = np.asarray(vals, dtype=np.float64)
             s = self.cfg.hw_scales[ch]
             data[ch] = (a - self.zero(ch, s)) * 0.01 * s
@@ -229,7 +300,13 @@ class DeviceBackend:
     def roll_read(self) -> Optional[Frame]:
         if self._roll_gen is None:
             return None
-        raw = next(self._roll_gen)
+        try:
+            raw = next(self._roll_gen)
+        except StopIteration:
+            self._roll_gen = None
+            raise BackendError("roll stream ended unexpectedly") from None
+        if not raw:  # driver heartbeat: no samples yet, lets the worker check for stop
+            return None
         data, clipped = self._to_volts(raw)
         dt = 1.0 / (self._roll_rate * rate_factor(len(self.cfg.active)))
         return Frame("roll", dt, data, clipped)
@@ -238,8 +315,8 @@ class DeviceBackend:
         if self._roll_gen is not None:
             try:
                 self._roll_gen.close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("roll generator close: %s", e)
             self._roll_gen = None
 
 
@@ -272,6 +349,7 @@ class DemoBackend:
         pass
 
     def configure(self, cfg: AcqConfig) -> None:
+        cfg.validate()
         self.cfg = cfg.copy()
 
     def recalibrate(self) -> None:

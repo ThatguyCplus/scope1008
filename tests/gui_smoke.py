@@ -1,8 +1,9 @@
 import sys, time
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import os; os.makedirs('shots', exist_ok=True)
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QTimer, QSettings
+from PySide6.QtCore import QSettings
 from scope1008.app import MainWindow, dark_palette
 app = QApplication(sys.argv); dark_palette(app)
 QSettings("Scope1008","Scope1008").clear()

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scope1008"
+version = "0.2.0"
+description = "Usable replacement software for the Hantek 1008A/B/C 8-channel USB scope"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+# Version ranges are the supported span. Exact, hash-checked versions live in
+# requirements.lock, which is what run.bat / run.sh install.
+dependencies = [
+    # Essentials only: the full PySide6 package drags in QtWebEngine (Chromium) and
+    # dozens of modules this app never loads.
+    "PySide6-Essentials>=6.7,<7",
+    "pyqtgraph>=0.13.7,<0.15",
+    "numpy>=1.26,<3",
+    "pyusb>=1.2.1,<2",
+    "libusb-package>=1.0.26,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "pip-audit>=2.7"]
+
+[project.scripts]
+scope1008 = "scope1008.__main__:main"
+
+[tool.setuptools]
+packages = ["scope1008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# pyflakes, bugbear, bandit (security) and a few correctness rules
+select = ["E9", "F", "B", "S", "PLE"]
+ignore = [
+    "B905",  # zip() strict= is noise for equal-length numpy columns
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+# Vendored driver: uses assert for protocol checks; kept close to upstream on purpose.
+"scope1008/hantek1008.py" = ["S101", "B", "F401"]
