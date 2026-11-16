@@ -12,6 +12,11 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if a.debug else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # The scope reader thread makes ~100s of tiny USB calls per second, each giving up and
+    # re-taking the GIL. With the default 5 ms switch interval it falls behind while the GUI
+    # thread draws, and the scope's roll FIFO overflows. 0.5 ms keeps it fed.
+    sys.setswitchinterval(0.0005)
+
     from PySide6.QtWidgets import QApplication
     from .app import MainWindow, dark_palette
 

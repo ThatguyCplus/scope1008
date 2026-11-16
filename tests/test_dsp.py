@@ -42,3 +42,14 @@ def test_device_config_sends_only_diffs():
     assert sent == ["f3", "a003", "aa0100010000010000", "a20302030303030303", "a310", "c10101", "ab0992"]
     sent.clear(); cfg.ns_per_div = 500000; b.configure(cfg)
     assert sent == ["f3", "a311"]
+
+
+def test_single_sample_glitch_after_edge_ignored():
+    # Pattern seen on a real 1008B: one sample right after a rising edge drops back low.
+    dt = 26.79e-6
+    t = np.arange(4000) * dt
+    v = np.where((t * 22.2) % 1 < 0.5, 12.0, 0.0)
+    rises = np.flatnonzero(np.diff(v) > 6) + 1
+    v[rises + 1] = 0.0
+    m = dsp.measure(v, dt)
+    assert abs(m["freq"] - 22.2) < 0.3 and abs(m["duty"] - 50) < 2

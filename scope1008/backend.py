@@ -26,6 +26,7 @@ COUNTS_HALF = 2047
 RECORD_DIVS = 10
 BURST_SAMPLES_TOTAL = 4000
 BURST_POLL_SLICE_S = 0.1  # max time acquire_burst blocks, so the worker stays responsive
+ROLL_READ_INTERVAL_S = 0.025  # batch roll reads; see DeviceBackend.roll_read
 
 # Burst (triggered) timebases offered in the GUI, ns/div.
 BURST_NS_PER_DIV = [({0: 1, 1: 2, 2: 5}[i % 3] * 10 ** (i // 3)) for i in range(26)]
@@ -176,6 +177,7 @@ class DeviceBackend:
         self._sent: dict = {}
         self._roll_gen = None
         self._roll_rate = ROLL_RATES[0]
+        self._roll_last_read = 0.0
         self._armed_at: Optional[float] = None  # monotonic time the current capture was started
 
     # -- discovery --------------------------------------------------------------------
@@ -389,6 +391,14 @@ class DeviceBackend:
     def roll_read(self) -> Optional[Frame]:
         if self._roll_gen is None:
             return None
+        # Read in ~25 ms batches. Without pacing (fast_io) each read returns ~2 samples, the
+        # worker emits ~650 frames/s, the GUI thread starves this one of the GIL, and the
+        # scope's roll FIFO overflows: the recording then has gaps and splices (seen on the
+        # bench as impossible NEP periods and extra sync edges). The FIFO holds seconds.
+        wait = ROLL_READ_INTERVAL_S - (time.monotonic() - self._roll_last_read)
+        if wait > 0:
+            time.sleep(wait)
+        self._roll_last_read = time.monotonic()
         try:
             raw = next(self._roll_gen)
         except StopIteration:

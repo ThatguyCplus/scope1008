@@ -83,6 +83,36 @@ channel on every range. If a probe is on a live signal you get a DC offset error
 
 `python -m scope1008 --debug` logs USB traffic, `--reset` forgets saved settings.
 
+## Recording with the Feather (scope + serial in one place)
+
+The **FEATHER** panel on the right connects to the eps_bench_nep Feather M4 CAN over USB serial
+(it picks the Feather's port automatically; COM11 on the bench laptop). It shows rpm, steering
+angle and sync count live, and the command box sends `r900`, `r0`, `z`, `?` to the Feather.
+Close any other serial monitor on that port first; only one program can open it.
+
+To record a session:
+
+1. Wire Feather **D13** to Hantek **CH4** (the sync line). Recording switches CH4 on if it is off.
+2. Connect the Feather, pick **Roll**, switch on the channels you want, press **● Rec**.
+3. Press **● Rec** again to stop. A folder appears in `Scope1008 sessions` in your home folder:
+
+| File | Contents |
+|---|---|
+| `scope.csv` | every Hantek sample of the recorded channels |
+| `feather.log` | every Feather line with the PC time (same format as `feather_log.py`) |
+| `merged.csv` | the scope samples with `sas_deg`, `sas_dps`, `sas_zeroed_deg`, `nep_rpm` added |
+| `can.csv` | every CAN frame (id, flags, length, data) on the scope time axis |
+| `session.txt` | what was recorded and how well the clocks were aligned |
+
+The Feather toggles D13 at random 200 to 1000 ms intervals and logs each edge with its own
+microsecond clock. The merge matches that pattern to the CH4 edges and fits offset and drift, so
+the Feather data lands on the scope time axis to well under a millisecond (0.18 ms rms on the
+bench). Record at least ~5 s so there are 6 or more sync edges. Without a Feather connected,
+**● Rec** works as before and asks for a file name.
+
+Sessions also get `can.csv`: every CAN frame the Feather saw (id, flags, length, data), timed on the
+scope axis. This needs the eps_bench_nep firmware that prints `C,...` lines (throttleECU, Nov 2026).
+
 ## Known limits
 
 * The protocol reverse engineering is partial. Connection, zero calibration, burst capture

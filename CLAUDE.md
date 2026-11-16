@@ -74,7 +74,36 @@ Hardware scripts in `tools/` (close the app first, only one program can hold the
 `verify_timebase.py`, `probe_timebase_ids.py`, `check_stale.py`, `bench_device.py`,
 `check_device.py`, `check_capture_time.py`, `check_burst_rates.py`, `gui_device_fps.py [us/div]`.
 
+## Feather link and sessions
+
+- `scope1008/feather.py`: `FeatherLink(QThread)` reads the eps_bench_nep Feather (115200 baud,
+  lines `N,us,rpm` / `A,us,deg,dps,zeroed` / `S,us,level,n` / `# ...`), keeps `FeatherState`, and
+  logs `<unix time>\t<line>` like throttleECU's `tools/feather_log.py`.
+- `scope1008/merge.py`: port of throttleECU's `tools/merge_hantek_feather.py`; matches D13 sync
+  edges (CH4, 1.0/2.3 V thresholds) and fits feather->scope time.
+- Roll **Rec** with the Feather connected writes a session folder under `~/Scope1008 sessions`
+  and merges on stop. Verified on the bench: 9 edges, 0.18 ms rms, clock ratio 0.9947 (roll
+  sample-rate error absorbed by the fit).
+- `tools/gui_session_test.py` records a session end to end without sending commands.
+
+## GIL and recording integrity (measured on the bench)
+
+The USB reader thread makes hundreds of tiny ctypes calls per second and must re-take the GIL
+after each one. Anything that holds the GIL for long starves it, the scope's roll FIFO
+overflows, and recordings get silent gaps (seen as impossible NEP periods and extra sync edges,
+which broke the D13 merge). Fixes that matter, keep them:
+- Antialiasing is off: antialiased 1.4 px traces made `QPainter.drawPath` take ~42 ms per redraw
+  (GIL held). Now ~1.5 ms, ~38 fps in roll.
+- `sys.setswitchinterval(0.0005)` in `__main__`.
+- `DeviceBackend.roll_read` batches reads every 25 ms; `FeatherLink` reads serial in 20 ms batches
+  and only emits `#` lines as Qt signals.
+- Check with `tools/gui_roll_debug.py 0.0005` (NEP running on CH3): bad periods must be 0.
+  10 s bench session: 26 sync edges, 0.23 ms rms, 0 bad NEP periods, 1199 CAN frames.
+
 ## Possible next work
+
+- Firmware now prints every CAN frame (`C,us,id,ext,rtr,len,hex`) and repeats `N` every second
+  (throttleECU eps_bench_nep). Sessions write `can.csv`. A CAN decoder (DBC) view is a next step.
 
 - Expose the 8 digital outputs (waveform generator) through `set_generator_*` in the driver. The
   driver marks these as untested.

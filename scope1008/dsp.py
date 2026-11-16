@@ -7,6 +7,19 @@ from typing import Dict, Optional
 import numpy as np
 
 
+def deglitch(v: np.ndarray) -> np.ndarray:
+    """3-point median: removes single-sample spikes, keeps edge positions.
+
+    Seen on a real 1008B: one sample right after a fast edge can drop back to the old level,
+    which would otherwise count as two extra edges and wreck frequency and trigger.
+    """
+    if v.size < 3:
+        return v
+    out = v.copy()
+    out[1:-1] = np.median(np.stack([v[:-2], v[1:-1], v[2:]]), axis=0)
+    return out
+
+
 def edge_crossings(v: np.ndarray, level: float, rising: bool, hyst: float) -> np.ndarray:
     """Fractional sample positions of edges through `level`, with hysteresis.
 
@@ -61,6 +74,7 @@ def measure(v: np.ndarray, dt: float) -> Dict[str, float]:
     hyst = max(0.1 * pp, 5 * noise)
     if hyst >= pp / 2:
         return out
+    v = deglitch(v)  # timing measurements ignore 1-sample spikes; levels above stay raw
     r = edge_crossings(v, mid, True, hyst)
     if r.size >= 2:
         period = (r[-1] - r[0]) / (r.size - 1) * dt

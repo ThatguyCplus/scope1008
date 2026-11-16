@@ -27,6 +27,8 @@ from .backend import (
     AcqConfig, BURST_NS_PER_DIV, HW_SCALES, N_CH, ROLL_S_PER_DIV, DemoBackend, Frame,
     burst_hw_timebase, hw_full_scale, pick_roll_rate,
 )
+from .feather import FeatherLink, list_ports
+from .merge import merge as merge_session
 from .worker import AcqWorker
 
 COLORS = ["#f5d90a", "#22d3ee", "#f472b6", "#4ade80", "#fb923c", "#818cf8", "#f87171", "#e5e7eb"]
@@ -39,6 +41,8 @@ TEXT = "#d1d5db"
 MUTED = "#7b8794"
 X_DIVS, Y_DIVS = 10, 8
 MAX_NAME = 24
+SESSIONS_DIR = Path.home() / "Scope1008 sessions"
+SYNC_CH = 3  # CH4 records the Feather's D13 sync line
 
 log = logging.getLogger(__name__)
 
@@ -277,6 +281,8 @@ class MainWindow(QMainWindow):
         self.roll_dt = 1 / 440
         self.rec_file = None
         self.rec_writer = None
+        self.feather: Optional[FeatherLink] = None
+        self.session_dir: Optional[Path] = None
         self.rec_t = 0.0
         self.rec_count = 0
         self._rec_flush = 0.0
@@ -434,7 +440,9 @@ class MainWindow(QMainWindow):
         vsplit = QSplitter(Qt.Vertical)
         lv.addWidget(vsplit, 1)
 
-        pg.setConfigOptions(antialias=True, background=BG, foreground=MUTED)
+        # No antialiasing: antialiased traces made QPainter.drawPath take ~40 ms per redraw
+        # while holding the GIL, which starved the USB reader and broke roll recordings.
+        pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
         self.vb = ScopeViewBox()
         self.vb.setMouseEnabled(False, False)
         self.vb.setMenuEnabled(False)
@@ -459,10 +467,13 @@ class MainWindow(QMainWindow):
         self.curves = []
         self.gnd_marks = []
         for i in range(N_CH):
-            rc = self.plot.plot(pen=pg.mkPen(QColor(COLORS[i]).darker(260), width=1.2))
+            rc = self.plot.plot(pen=pg.mkPen(QColor(COLORS[i]).darker(260), width=1))
+            rc.setDownsampling(auto=True, method="peak")
+            rc.setClipToView(True)
             self.ref_curves.append(rc)
         for i in range(N_CH):
-            c = self.plot.plot(pen=pg.mkPen(COLORS[i], width=1.4))
+            c = self.plot.plot(pen=pg.mkPen(COLORS[i], width=1))
+            c.setSkipFiniteCheck(True)
             c.setDownsampling(auto=True, method="peak")
             c.setClipToView(True)
             self.curves.append(c)
@@ -578,6 +589,38 @@ class MainWindow(QMainWindow):
         tg.addWidget(self.meas_src, 6, 0, 1, 2)
         sv.addWidget(trig)
 
+        fp = QFrame()
+        fp.setObjectName("feather")
+        fp.setStyleSheet(f"#feather {{ background:{PANEL}; border:1px solid {BORDER}; border-radius:6px; }}")
+        fg = QGridLayout(fp)
+        fg.setContentsMargins(8, 6, 8, 8)
+        t = QLabel("FEATHER")
+        t.setStyleSheet("font-weight:700; letter-spacing:1px;")
+        self.fe_state = QLabel(pill("OFF", "#6b7280"))
+        fg.addWidget(t, 0, 0)
+        fg.addWidget(self.fe_state, 0, 2, Qt.AlignRight)
+        self.fe_port = QComboBox()
+        self.fe_port.setToolTip("Feather USB serial port (COM11 on the bench laptop)")
+        self.fe_refresh = self._btn("⟳", "Rescan serial ports")
+        self.fe_conn = self._btn("Connect", "Open the Feather serial port", True)
+        fg.addWidget(self.fe_port, 1, 0)
+        fg.addWidget(self.fe_refresh, 1, 1)
+        fg.addWidget(self.fe_conn, 1, 2)
+        self.fe_info = QLabel("rpm --   SAS --   sync --")
+        self.fe_info.setStyleSheet("font-family:monospace;")
+        fg.addWidget(self.fe_info, 2, 0, 1, 3)
+        self.fe_cmd = QLineEdit()
+        self.fe_cmd.setPlaceholderText("command: r900  r0  z  ?   (Enter)")
+        self.fe_cmd.setMaxLength(64)
+        self.fe_cmd.setEnabled(False)
+        fg.addWidget(self.fe_cmd, 3, 0, 1, 3)
+        self.fe_msg = QLabel()
+        self.fe_msg.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self.fe_msg.setWordWrap(True)
+        fg.addWidget(self.fe_msg, 4, 0, 1, 3)
+        sv.addWidget(fp)
+        self._scan_ports()
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -628,6 +671,12 @@ class MainWindow(QMainWindow):
         self.level50.clicked.connect(self.level_50)
         self.trig_line.sigPositionChanged.connect(self._on_level_drag)
         self.meas_src.currentIndexChanged.connect(self._on_meas_src)
+        self.fe_refresh.clicked.connect(self._scan_ports)
+        self.fe_conn.toggled.connect(self.toggle_feather)
+        self.fe_cmd.returnPressed.connect(self._send_feather)
+        self.fe_timer = QTimer(self)
+        self.fe_timer.setInterval(250)
+        self.fe_timer.timeout.connect(self._update_feather_info)
         for ln in self.cx + self.cy:
             ln.sigPositionChanged.connect(self.update_cursor_readout)
 
@@ -758,7 +807,24 @@ class MainWindow(QMainWindow):
             self.worker.set_config(self.build_config())
 
     # ---------------------------------------------------------------- UI handlers
+    def _follow_active(self):
+        """Trigger and measure sources must be channels that are on.
+
+        A switched-off channel is not captured, so triggering on it silently free-runs and
+        the traces jump around. Move the source to the first channel that is on.
+        """
+        act = self.active()
+        if not act:
+            return
+        if self.trig_ch not in act:
+            self.trig_ch = act[0]
+            if self.mode != "roll":
+                self.status_lbl.setText(f"Trigger source moved to CH{act[0] + 1} (the old one is off)")
+        if self.measure_ch not in act:
+            self.measure_ch = act[0]
+
     def _sync_all(self):
+        self._follow_active()
         self.run_btn.blockSignals(True)
         self.run_btn.setChecked(self.running)
         self.run_btn.setText("RUN" if self.running else "STOP")
@@ -972,7 +1038,7 @@ class MainWindow(QMainWindow):
         trig_pos = None
         if self.trig_ch in data:
             c = self.channels[self.trig_ch]
-            pos = dsp.edge_crossings(data[self.trig_ch][:n], self.trig_level, self.trig_rising,
+            pos = dsp.edge_crossings(dsp.deglitch(data[self.trig_ch][:n]), self.trig_level, self.trig_rising,
                                      hyst=max(0.12 * c.vdiv, 1e-4))
             pre = max(0.0, (X_DIVS / 2 - self.hpos) * td / dt)
             post = max(0.0, (X_DIVS / 2 + self.hpos) * td / dt)
@@ -1168,6 +1234,11 @@ class MainWindow(QMainWindow):
         self.refs = {}
         self.redraw()
 
+    def _col_name(self, i: int) -> str:
+        """CSV column for a channel: CH1_V, or CH1_VT3_V when the channel has a label."""
+        name = clean_name(self.channels[i].name).replace(" ", "_")
+        return f"CH{i + 1}_{name}_V" if name else f"CH{i + 1}_V"
+
     def _set_status(self, text: str) -> None:
         self.status_lbl.setText(html.escape(text))
 
@@ -1202,7 +1273,7 @@ class MainWindow(QMainWindow):
                     f.write(f"# CH{i + 1} '{clean_name(c.name)}' probe={c.probe}x coupling={c.coupling} "
                             f"range={RANGE_LABELS[self.hw_scale(i)]}\n")
                 w = csv.writer(f)
-                w.writerow(["time_s"] + [csv_cell(f"CH{i + 1}{'_' + clean_name(self.channels[i].name) if self.channels[i].name else ''}_V")
+                w.writerow(["time_s"] + [csv_cell(self._col_name(i))
                                          for i in chans])
                 w.writerows(zip(np.round(x, 9), *[np.round(views[i], 5) for i in chans]))
         except OSError as e:
@@ -1219,9 +1290,125 @@ class MainWindow(QMainWindow):
             else:
                 self._set_status(f"Could not save PNG to {p}")
 
+    # ---------------------------------------------------------------- Feather
+    def _scan_ports(self):
+        cur = self.fe_port.currentData()
+        self.fe_port.clear()
+        for dev, desc in list_ports():
+            self.fe_port.addItem(f"{dev}  {desc[:28]}", dev)
+        want = cur or self.settings.value("feather_port", "COM11")
+        i = self.fe_port.findData(want)
+        if i >= 0:
+            self.fe_port.setCurrentIndex(i)
+
+    def toggle_feather(self, on: bool):
+        if on:
+            port = self.fe_port.currentData()
+            if not port:
+                self.fe_msg.setText("No serial port found. Plug in the Feather and press ⟳.")
+                self.fe_conn.setChecked(False)
+                return
+            self.settings.setValue("feather_port", port)
+            self.feather = FeatherLink(port)
+            self.feather.status.connect(self._on_feather_status)
+            self.feather.line.connect(self._on_feather_line)
+            self.feather.start()
+            self.fe_conn.setText("Disconnect")
+            self._fe_can_mark, self._fe_can_hz = (time.time(), 0), 0.0
+            self.fe_timer.start()
+        else:
+            if self.feather:
+                self.feather.stop()
+                self.feather = None
+            self.fe_conn.setText("Connect")
+            self.fe_cmd.setEnabled(False)
+            self.fe_state.setText(pill("OFF", "#6b7280"))
+            self.fe_timer.stop()
+
+    def _on_feather_status(self, state: str, msg: str):
+        self.fe_msg.setText(html.escape(msg))
+        if state == "ok":
+            self.fe_state.setText(pill("ON", "#4ade80"))
+            self.fe_cmd.setEnabled(True)
+        elif state == "error":
+            self.fe_state.setText(pill("ERR", "#f87171"))
+            self.fe_conn.blockSignals(True)
+            self.fe_conn.setChecked(False)
+            self.fe_conn.blockSignals(False)
+            self.toggle_feather(False)
+            self.fe_msg.setText(html.escape(msg))
+
+    def _on_feather_line(self, t: float, line: str):
+        if line.startswith("#"):
+            self.fe_msg.setText(html.escape(line[1:].strip()))
+
+    def _send_feather(self):
+        txt = self.fe_cmd.text().strip()
+        if self.feather and txt:
+            self.feather.send(txt)
+            self.fe_cmd.clear()
+
+    def _update_feather_info(self):
+        if not self.feather:
+            return
+        st = self.feather.state
+        rpm = "--" if st.rpm is None else f"{st.rpm:.0f}"
+        sas = "--" if st.sas_zeroed is None else f"{st.sas_zeroed:+.1f}°"
+        now = time.time()
+        stale = st.last_rx and now - st.last_rx > 2
+        total = st.counts.get("C", 0)
+        last_t, last_n = self._fe_can_mark
+        if now - last_t >= 1.0:  # CAN frame rate over the last second
+            self._fe_can_hz = (total - last_n) / (now - last_t)
+            self._fe_can_mark = (now, total)
+        self.fe_info.setText(f"rpm {rpm}   SAS {sas}   sync {st.sync_count}\n"
+                             f"CAN {self._fe_can_hz:.0f} frames/s, {len(st.can_ids)} ids"
+                             + ("   (no data)" if stale else ""))
+        self.fe_info.setToolTip("CAN ids seen: " + ", ".join(
+            f"0x{k} ({v})" for k, v in sorted(st.can_ids.items(), key=lambda kv: -kv[1])[:20]))
+
+    def _start_session(self) -> Optional[Path]:
+        """Folder for a combined recording: scope.csv + feather.log (+ merged.csv on stop)."""
+        d = SESSIONS_DIR / time.strftime("%Y%m%d_%H%M%S")
+        try:
+            d.mkdir(parents=True, exist_ok=False)
+        except OSError as e:
+            self._set_status(f"Could not create {d}: {e}")
+            return None
+        return d
+
+    def _finish_session(self):
+        d, self.session_dir = self.session_dir, None
+        if d is None:
+            return
+        n = self.feather.stop_log() if self.feather else 0
+        scope_csv, fl = d / "scope.csv", d / "feather.log"
+        if not fl.exists() or n == 0:
+            self._set_status(f"Session saved to {d} (no Feather data)")
+            return
+        try:
+            r = merge_session(scope_csv, fl, d / "merged.csv", sync=f"CH{SYNC_CH + 1}")
+        except Exception as e:
+            log.exception("merge failed")
+            self._set_status(f"Session saved to {d}; merge failed: {e}")
+            return
+        (d / "session.txt").write_text(
+            f"scope.csv     Hantek roll recording\nfeather.log   {n} Feather lines\n"
+            f"merged.csv    {'aligned with D13 sync on CH4' if r.ok else 'NOT aligned'}\n"
+            f"can.csv       {r.can_frames} CAN frames, times on the scope axis\n\n{r.message}\n",
+            encoding="utf-8")
+        self._set_status(f"Session {d.name}: {r.message}" if r.ok else f"Session {d.name}: {r.message}")
+
     def toggle_record(self, on: bool):
         if on:
-            p = self._ask_path("Record to CSV", "csv", "CSV (*.csv)")
+            with_feather = self.feather is not None and self.feather.isRunning()
+            if with_feather:
+                if SYNC_CH not in self.active():
+                    self.cards[SYNC_CH].btn.setChecked(True)  # sync channel must be recorded
+                self.session_dir = self._start_session()
+                p = str(self.session_dir / "scope.csv") if self.session_dir else ""
+            else:
+                p = self._ask_path("Record to CSV", "csv", "CSV (*.csv)")
             if not p:
                 self.rec_btn.blockSignals(True)
                 self.rec_btn.setChecked(False)
@@ -1232,7 +1419,7 @@ class MainWindow(QMainWindow):
                 f.write(f"# Scope1008 roll recording started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"# sample rate {1 / self.roll_dt:.3f} Sa/s per channel\n")
                 w = csv.writer(f)
-                w.writerow(["time_s"] + [f"CH{i + 1}_V" for i in self.active()])
+                w.writerow(["time_s"] + [csv_cell(self._col_name(i)) for i in self.active()])
             except OSError as e:
                 log.error("cannot start recording: %s", e)
                 self.rec_btn.blockSignals(True)
@@ -1244,7 +1431,12 @@ class MainWindow(QMainWindow):
             self.rec_t = 0.0
             self.rec_count = 0
             self._rec_flush = time.time()
-            self._set_status(f"Recording to {p}")
+            if self.session_dir and self.feather:
+                try:
+                    self.feather.start_log(self.session_dir / "feather.log")
+                except OSError as e:
+                    self._set_status(f"Feather log failed: {e}")
+            self._set_status(f"Recording to {self.session_dir or p}")
         else:
             f, self.rec_file, self.rec_writer = self.rec_file, None, None
             if f:
@@ -1253,6 +1445,7 @@ class MainWindow(QMainWindow):
                     self._set_status(f"Recording stopped, {self.rec_count} rows")
                 except OSError as e:
                     self._set_status(f"Recording stopped with a write error: {e}")
+            self._finish_session()
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev):
@@ -1261,6 +1454,8 @@ class MainWindow(QMainWindow):
             self.worker.stop()
         if self.rec_file:
             self.rec_btn.setChecked(False)
+        if self.feather:
+            self.feather.stop()
         super().closeEvent(ev)
 
 
