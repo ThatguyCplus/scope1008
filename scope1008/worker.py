@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from PySide6.QtCore import QThread, Signal
 
@@ -15,6 +16,7 @@ class AcqWorker(QThread):
     frame = Signal(object)
     status = Signal(str, str)        # state ("connecting"|"ok"|"warn"|"error"|"demo"), message
     opened = Signal(str)             # backend name
+    progress = Signal(float)         # 0..1 fill of a slow burst capture still in progress
 
     def __init__(self, demo: bool, cfg: AcqConfig, parent=None):
         super().__init__(parent)
@@ -27,6 +29,7 @@ class AcqWorker(QThread):
         self._stop = threading.Event()
         self._recal = threading.Event()
         self.backend = None
+        self._last_progress = 0.0
 
     # called from GUI thread ---------------------------------------------------------
     def set_config(self, cfg: AcqConfig) -> None:
@@ -51,6 +54,15 @@ class AcqWorker(QThread):
         return done
 
     # thread ------------------------------------------------------------------------
+    def _report_progress(self) -> None:
+        """Tell the GUI how far a slow capture has filled, at most ~8 times a second."""
+        get = getattr(self.backend, "capture_progress", None)
+        frac = get() if get else None
+        now = time.monotonic()
+        if frac is not None and now - self._last_progress > 0.12:
+            self._last_progress = now
+            self.progress.emit(frac)
+
     def run(self) -> None:
         self.backend = DemoBackend() if self.demo else DeviceBackend()
         self.status.emit("connecting", "Connecting and calibrating zero offsets (leave inputs open)...")
@@ -103,6 +115,8 @@ class AcqWorker(QThread):
                     fr = self.backend.roll_read()
                 else:
                     fr = self.backend.acquire_burst()
+                    if fr is None:
+                        self._report_progress()
                 if fr is not None:
                     self.frame.emit(fr)
                 errors = 0

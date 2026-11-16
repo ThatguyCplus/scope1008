@@ -110,3 +110,34 @@ def test_channel_from_corrupt_settings():
     assert c.offset == 4.0 and c.range == "Auto" and c.name == "5"
     assert channel_from_dict("garbage", 0).enabled is True
     assert channel_from_dict({"vdiv": 1e9}, 0).vdiv == VDIVS[-1]
+
+
+# -- timebase table (measured on a 1008B) ------------------------------------------------
+
+def test_ignored_timebase_codes_are_substituted():
+    from scope1008.backend import BURST_NS_PER_DIV, burst_hw_timebase
+    assert burst_hw_timebase(1_000_000)[0] == 5_000_000
+    assert burst_hw_timebase(2_000_000)[0] == 5_000_000
+    assert burst_hw_timebase(20_000_000)[0] == 100_000_000
+    assert burst_hw_timebase(50_000_000)[0] == 100_000_000
+    for ns in BURST_NS_PER_DIV:
+        hw, span = burst_hw_timebase(ns)
+        # the record must always cover the 10 divisions on screen
+        assert span >= 10 * ns * 1e-9 * 0.999, ns
+        assert hw in BURST_NS_PER_DIV
+
+
+def test_device_sends_substituted_code():
+    from scope1008.hantek1008 import Hantek1008
+    sent = []
+
+    def fake(self, msg, n, **k):
+        sent.append(msg.hex())
+        return bytes([msg[0]]) + bytes(n - 1) if n else b""
+    Hantek1008._Hantek1008Raw__write_and_receive = fake
+    d = Hantek1008()
+    d._zero_offsets = {1.0: [2048.0] * 8, 0.125: [2048.0] * 8, 0.02: [2048.0] * 8}
+    b = DeviceBackend()
+    b.dev = d
+    b.configure(AcqConfig(ns_per_div=20_000_000))
+    assert "a318" in sent  # id 24 = 100 ms/div, not the ignored id 22

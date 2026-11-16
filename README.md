@@ -87,11 +87,14 @@ channel on every range. If a probe is on a live signal you get a DC offset error
 
 * The protocol reverse engineering is partial. Connection, zero calibration, burst capture
   (about 16 fps at fast timebases) and roll mode are confirmed on a 1008B.
-* **Time axis:** a burst record spans 10 divisions (measured exactly at 5, 10, 100 and 200 ms/div)
-  and holds 4000 samples split across the active channels. At 1, 2, 20 and 50 ms/div the scope
-  finishes captures faster than 10 divisions should take, so the timebase code for those settings
-  may be wrong. Check with a signal of known frequency: `.venv\Scripts\python tools\check_device.py`.
-* Slow timebases update once per capture: 200 ms/div shows a new frame every 2 s.
+* **Time axis:** verified against a 22.5 Hz square wave at every timebase from 1 ms/div to
+  200 ms/div, with 1 and 2 channels: within 0.3 % (2 % at 200 ms/div with 2 channels, where one
+  sample is 1 ms). The scope ignores its own codes for 1, 2, 20 and 50 ms/div, so those settings
+  capture at 5 ms/div or 100 ms/div and show the matching slice of the longer record.
+  500 us/div and faster are not verified yet (they need a faster reference signal);
+  `tools\verify_timebase.py` does the check.
+* Slow timebases update once per capture (20 to 100 ms/div about once a second, 200 ms/div every
+  2 s). The trigger badge shows **FILL nn%** while a capture fills, so the display is not frozen.
 * If your unit reports a different USB product id, set `SCOPE1008_PID=xxxx` before launching
   (the error message tells you the id it found).
 * The 8 digital outputs (waveform generator) are not exposed yet.

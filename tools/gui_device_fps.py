@@ -21,6 +21,7 @@ if len(sys.argv) > 1:  # optional timebase in us/div, e.g. 500
 w.resize(1600, 950)
 w.show()
 frames = []
+fills = []
 w.worker_frame_hook = None
 end = time.time() + 10
 while time.time() < end:
@@ -28,9 +29,11 @@ while time.time() < end:
     time.sleep(0.002)
     if w.worker is not None and not getattr(w.worker, "_hooked", False):
         w.worker.frame.connect(lambda fr: frames.append(time.perf_counter()))
+        w.worker.progress.connect(lambda f: fills.append(round(f, 2)))
         w.worker._hooked = True
 print("status:", w.status_lbl.text()[-80:])
 print("info:", w.info_lbl.text())
+print("fill updates:", len(fills), fills[:12])
 late = [b - a for a, b in zip(frames[len(frames) // 2:], frames[len(frames) // 2 + 1:])]
 if late:
     late.sort()

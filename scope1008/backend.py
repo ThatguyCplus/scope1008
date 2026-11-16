@@ -21,17 +21,42 @@ N_CH = 8
 # Hardware pre-scale factors. 1 count = 10 mV * factor, ADC is 12 bit centred on ~2048.
 HW_SCALES = [1.0, 0.125, 0.02]
 COUNTS_HALF = 2047
-# Measured on a 1008B: a burst record always spans 10 divisions (the 'ready' flag rises
-# exactly 10 * time/div after arming at slow timebases) and holds 4000 samples split
-# across the active channels. dt therefore = 10 div * time/div / samples per channel.
+# A burst record holds 4000 samples split across the active channels and covers a fixed
+# time span per hardware timebase code. dt = span / samples per channel.
 RECORD_DIVS = 10
 BURST_SAMPLES_TOTAL = 4000
 BURST_POLL_SLICE_S = 0.1  # max time acquire_burst blocks, so the worker stays responsive
 
-# Burst (triggered) timebases in ns/div. The ADC tops out at 2.4 MSa/s, so anything
-# faster than ~10 us/div is just interpolation; we start at 10 us.
+# Burst (triggered) timebases offered in the GUI, ns/div.
 BURST_NS_PER_DIV = [({0: 1, 1: 2, 2: 5}[i % 3] * 10 ** (i // 3)) for i in range(26)]
 BURST_NS_PER_DIV = [v for v in BURST_NS_PER_DIV if 10_000 <= v <= 200_000_000]
+
+# Displayed timebase -> (hardware timebase sent to the scope, record span in seconds).
+# Measured on a 1008B with a 22.5 Hz square wave (tools/probe_timebase_ids.py,
+# tools/check_stale.py): the codes for 1, 2, 20 and 50 ms/div are ignored by the device (it
+# keeps the previous rate), so those settings capture at the nearest working code and the
+# GUI shows a slice of the longer record. 5 and 10 ms/div records are ~7 % longer than
+# 10 div. Spans for 500 us/div and faster are nominal (10 div) and not yet verified: they
+# need a faster reference signal than 22.5 Hz.
+_MEASURED_SPAN_S = {
+    5_000_000: 4000 * 13.20e-6,     # 1704 samples per 22.5 ms half period
+    10_000_000: 4000 * 26.79e-6,    # 840
+    100_000_000: 4000 * 250.0e-6,   # 90, ready flag after 1.007 s
+    200_000_000: 4000 * 500.0e-6,   # 45, ready flag after 2.006 s
+}
+_SUBSTITUTE = {1_000_000: 5_000_000, 2_000_000: 5_000_000,
+               20_000_000: 100_000_000, 50_000_000: 100_000_000}
+
+
+def burst_hw_timebase(ns_per_div: int) -> tuple[int, float]:
+    """(hardware ns/div to send, record span in seconds) for a displayed timebase."""
+    hw = _SUBSTITUTE.get(ns_per_div, ns_per_div)
+    span = _MEASURED_SPAN_S.get(hw, RECORD_DIVS * hw * 1e-9)
+    return hw, span
+
+
+def timebase_verified(ns_per_div: int) -> bool:
+    return burst_hw_timebase(ns_per_div)[0] in _MEASURED_SPAN_S
 
 # Roll mode: per-channel sample rates the device supports (Hz, before the channel-count factor)
 ROLL_RATES = [440, 220, 88, 44, 22, 11, 5, 2, 1, 0.5, 0.25, 0.125, 1.0 / 16]
@@ -248,20 +273,21 @@ class DeviceBackend:
         want = {
             "active": tuple(active),
             "scales": tuple(cfg.hw_scales),
-            "tdiv": cfg.ns_per_div,
+            "tdiv": burst_hw_timebase(cfg.ns_per_div)[0],
             "trig": (cfg.trig_ch, cfg.trig_slope),
             "level": level_raw,
         }
         self._set_attr("active_channels", list(active))
         self._set_attr("vertical_scale_factors", list(cfg.hw_scales))
-        self._set_attr("ns_per_div", cfg.ns_per_div)
+        hw_ns = burst_hw_timebase(cfg.ns_per_div)[0]
+        self._set_attr("ns_per_div", hw_ns)
         self._cmd("send_ping")
         if self._sent.get("active") != want["active"]:
             self._cmd("send_set_active_channels", list(active))
         if self._sent.get("scales") != want["scales"]:
             self._cmd("send_set_vertical_scale", list(cfg.hw_scales))
         # timebase is always resent: roll mode reuses the same register
-        self._cmd("send_set_time_div", cfg.ns_per_div)
+        self._cmd("send_set_time_div", hw_ns)
         if self._sent.get("trig") != want["trig"]:
             self._cmd("send_set_trigger", cfg.trig_ch, cfg.trig_slope)
         if self._sent.get("level") != want["level"]:
@@ -299,7 +325,14 @@ class DeviceBackend:
 
     def capture_timeout(self) -> float:
         """How long a capture may take before it is considered lost and re-armed."""
-        return RECORD_DIVS * self.cfg.ns_per_div * 1e-9 * 1.5 + 1.0
+        return burst_hw_timebase(self.cfg.ns_per_div)[1] * 1.5 + 1.0
+
+    def capture_progress(self) -> Optional[float]:
+        """Fraction (0..1) of the current capture's expected fill time, or None if idle."""
+        if self._armed_at is None or self.cfg is None:
+            return None
+        span = burst_hw_timebase(self.cfg.ns_per_div)[1]
+        return min(1.0, (time.monotonic() - self._armed_at) / span) if span > 0 else None
 
     def acquire_burst(self) -> Optional[Frame]:
         """One triggered record, or None if it is still filling.
@@ -343,7 +376,7 @@ class DeviceBackend:
         n = min((v.size for v in data.values()), default=0)
         if n == 0:
             return None
-        dt = RECORD_DIVS * self.cfg.ns_per_div * 1e-9 / n
+        dt = burst_hw_timebase(self.cfg.ns_per_div)[1] / n
         return Frame("burst", dt, data, clipped)
 
     def roll_start(self, rate: float) -> None:

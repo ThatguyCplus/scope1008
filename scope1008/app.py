@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from . import dsp
 from .backend import (
     AcqConfig, BURST_NS_PER_DIV, HW_SCALES, N_CH, ROLL_S_PER_DIV, DemoBackend, Frame,
-    hw_full_scale, pick_roll_rate,
+    burst_hw_timebase, hw_full_scale, pick_roll_rate,
 )
 from .worker import AcqWorker
 
@@ -690,6 +690,7 @@ class MainWindow(QMainWindow):
         self.worker = AcqWorker(demo, self.build_config())
         self.worker.frame.connect(self.on_frame)
         self.worker.status.connect(self.on_status)
+        self.worker.progress.connect(self.on_progress)
         self.worker.set_running(self.running)
         self.worker.start()
 
@@ -1122,8 +1123,21 @@ class MainWindow(QMainWindow):
                 parts.append(f"│ trace@X1 {dsp.si(a, 'V')}  @X2 {dsp.si(b, 'V')}")
         self.cur_lbl.setText("   ".join(parts))
 
+    def on_progress(self, frac: float):
+        """A slow capture is still filling: show it instead of looking frozen."""
+        if self.mode == "roll" or not self.running:
+            return
+        # only worth showing when the capture takes noticeably longer than a frame
+        if burst_hw_timebase(BURST_NS_PER_DIV[self.tdiv_i])[1] < 0.3:
+            return
+        self.trig_state = f"FILL {frac:.0%}"
+        self._update_trig_lbl()
+
     def _update_trig_lbl(self):
         st = self.trig_state
+        if st.startswith("FILL"):
+            self.trig_state_lbl.setText(pill(st, "#60a5fa") if self.running else pill("STOP", "#9ca3af"))
+            return
         col = {"TRIG'D": "#4ade80", "AUTO": "#fbbf24", "WAIT": "#f87171", "ROLL": "#60a5fa",
                "ARMED": "#f59e0b", "STOP": "#9ca3af"}.get(st, MUTED)
         if not self.running and st != "STOP":

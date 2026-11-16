@@ -53,17 +53,26 @@ Findings that changed the code:
   `acquire_burst` arms once and polls across calls in 100 ms slices (the driver gave up after
   20 polls and restarted, so 100 ms/div and slower never produced a frame).
 
+- Timebase codes (command a3), probed 0-31 with `tools/probe_timebase_ids.py`: ids 18, 19, 22
+  and 23 (1, 2, 20, 50 ms/div) are ignored, the device keeps the previous rate. Ids 26+ never
+  report ready. `burst_hw_timebase()` maps each displayed timebase to a working code and its
+  measured record span (`_MEASURED_SPAN_S`, `_SUBSTITUTE` in backend.py); the GUI shows the
+  slice of the longer record. Spans at 5 and 10 ms/div are ~7 % longer than 10 div.
+- Verified end to end (`tools/verify_timebase.py`, 22.5 Hz square wave): 1 to 200 ms/div within
+  0.3 % with 1 and 2 channels. The record span does not depend on the channel count.
+- Slow captures report progress (`capture_progress()`, worker `progress` signal); the GUI shows
+  "FILL nn%".
+
 Still unverified (priority order):
-1. **Timebase codes at 1, 2, 20 and 50 ms/div:** captures finish faster than 10 div. The driver's
-   `__burst_mode_ns_per_div_to_id_dic` is a 1-2-5 formula, not confirmed codes. Needs a known
-   frequency; `tools/check_device.py` and `tools/check_capture_time.py` help.
-2. **Fast timebases** (below about 200 us/div with 1 channel) would exceed the 2.4 MSa/s ADC if the
-   record really spans 10 div, so the record length there is probably different.
-3. **Changing active channels and scales mid-session** by replaying the tail of `_init3`.
+1. **500 us/div and faster** (ids 9-17): records are fresh and arrive at ~20 fps, but the span is
+   still the nominal 10 div. The ADC limit (2.4 MSa/s) suggests 1-channel spans below about
+   200 us/div cannot be 10 div. Needs a reference of 1 kHz or more; run
+   `tools/verify_timebase.py --ch N --half-ms <half period>` and add measured spans.
+2. **Changing active channels and scales mid-session** by replaying the tail of `_init3`.
 
 Hardware scripts in `tools/` (close the app first, only one program can hold the USB device):
-`bench_device.py`, `check_device.py`, `check_capture_time.py`, `check_burst_rates.py`,
-`gui_device_fps.py [us/div]`.
+`verify_timebase.py`, `probe_timebase_ids.py`, `check_stale.py`, `bench_device.py`,
+`check_device.py`, `check_capture_time.py`, `check_burst_rates.py`, `gui_device_fps.py [us/div]`.
 
 ## Possible next work
 
